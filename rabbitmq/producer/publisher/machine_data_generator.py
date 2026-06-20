@@ -324,6 +324,9 @@ class SyntheticMachineGenerator:
             name: ComponentState(name, self.rng, accel=accel) for name in COMPONENTS
         }
 
+        # Lot / production tracking (must be set before _init_sensors)
+        self.article: int = self.rng.choice(_ARTICLES)
+
         # Sensor dynamics (OU processes — one per measured signal)
         self._init_sensors()
 
@@ -331,8 +334,6 @@ class SyntheticMachineGenerator:
         self.state: str = "idle"  # start idle, will transition to running
         self.state_remaining_s: float = 5.0  # short initial idle
 
-        # Lot / production tracking
-        self.article: int = self.rng.choice(_ARTICLES)
         self.lot_1: int = self.rng.randint(2_000_000, 2_999_999)
         self.lot_2: int = self.lot_1 + 1
         self.lot_target_m: float = self.rng.uniform(1000.0, 2500.0)
