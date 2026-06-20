@@ -5,10 +5,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY publisher.py .
 COPY machine_data_generator.py .
-
-# Create data directory
-RUN mkdir -p /app/data
+COPY publisher.py .
+COPY backfill.py .
 
 CMD ["python", "publisher.py"]
