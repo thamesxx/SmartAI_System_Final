@@ -1,0 +1,71 @@
+{
+  "vhosts": [
+    { "name": "/" }
+  ],
+
+  "users": [
+    {
+      "name": "guest",
+      "password": "guest",
+      "tags": "administrator"
+    }
+  ],
+
+  "permissions": [
+    {
+      "user": "guest",
+      "vhost": "/",
+      "configure": ".*",
+      "write": ".*",
+      "read": ".*"
+    }
+  ],
+
+  "exchanges": [
+    {
+      "name": "scada_data",
+      "vhost": "/",
+      "type": "topic",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "arguments": {}
+    }
+  ],
+
+  "queues": [
+    {
+      "name": "scada_data_queue",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {}
+    },
+    {
+      "name": "sensor_health_data_queue",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {}
+    }
+  ],
+
+  "bindings": [
+    {
+      "source": "scada_data",
+      "vhost": "/",
+      "destination": "scada_data_queue",
+      "destination_type": "queue",
+      "routing_key": "scada.tag.data",
+      "arguments": {}
+    },
+    {
+      "source": "scada_data",
+      "vhost": "/",
+      "destination": "sensor_health_data_queue",
+      "destination_type": "queue",
+      "routing_key": "scada.sensor.health",
+      "arguments": {}
+    }
+  ]
+}
