@@ -28,6 +28,40 @@ parallel. The model (Part B) and its live display (Part C) are the headline.
 
 ---
 
+## 0.1 Data access — MySQL via SQLAlchemy (shared by backend + ML)
+
+Plan 01 moved the store to **MySQL**. Before Parts A–C, rewrite the access layer:
+
+- **`backend/app/models.py`** (new, shared) — SQLAlchemy ORM `Reading` + `MachineRun`
+  (the tables in Plan 01 §11/§12). Imported by the consumer, the backend, and `ml/`.
+- **`backend/app/database.py`** — replace the PyMongo client with a SQLAlchemy engine +
+  `SessionLocal`; **keep the helper names** (`to_float`, `hms_to_minutes`,
+  `parse_timestamp`, `map_status`) so services barely change. They now run mostly at
+  **ingest** (consumer), since columns are already typed; `session_name_map()` becomes one
+  grouped query:
+  ```python
+  def session_name_map(db) -> dict[str, str]:
+      rows = db.execute(select(Reading.session_id, func.min(Reading.ts).label("first_ts"))
+                        .group_by(Reading.session_id).order_by("first_ts")).all()
+      return {sid: f"Machine {i+1}" for i, (sid, _) in enumerate(rows)}
+  ```
+- **Convert the 5 services** (`analytics_service`, `records_service`, `utilities_service`,
+  `alerts_service`, `machine_service`) from `readings_collection()` / aggregation to
+  `select(...)`. Representative mappings:
+
+  | Mongo today | MySQL (SQLAlchemy) |
+  |---|---|
+  | `col.distinct("session_id")` | `select(Reading.session_id).distinct()` |
+  | `col.find_one({"session_id": sid}, sort=[("seq",1)])` | `select(Reading).where(Reading.session_id==sid).order_by(Reading.seq).limit(1)` |
+  | latest window for a machine | `select(Reading).where(...).order_by(Reading.seq.desc()).limit(W)` |
+  | OEE state-duration counts | `select(Reading.state, func.count()).group_by(Reading.state)` |
+
+- **Config** — `backend/app/config.py` exposes `DATABASE_URL`
+  (`mysql+pymysql://…/machine_telemetry?charset=utf8mb4`). Deps: `SQLAlchemy>=2.0`,
+  `PyMySQL>=1.1`, `cryptography`.
+
+---
+
 # PART A — OEE (Overall Equipment Effectiveness)
 
 ## A.1 Formulas
@@ -54,8 +88,10 @@ downtime — exactly what makes the graph interesting.
 
 ## A.2 Backend — `backend/app/services/oee_service.py`
 
-Reuse helpers already in `backend/app/database.py`: `readings_collection`,
-`parse_timestamp`, `to_float`, `map_status`, `session_name_map`.
+Use the SQLAlchemy access layer (§0.1): a `Session`, the `Reading` ORM model, and the
+retained helpers (`map_status`, `session_name_map`). Pillars come from SQL — e.g. state
+durations via `select(Reading.state, func.count()).group_by(Reading.state)`, throughput
+from `speed`/`length` columns, quality from `good_count`/`reject_count` sums.
 
 ```python
 def get_oee_snapshot() -> list[dict]:
@@ -118,13 +154,21 @@ RUL regression is an optional stretch, not required.
 ## B.2 The `ml/` package
 ```
 ml/
-  config.py     # H, window sizes, feature list, paths, class names, thresholds
-  features.py   # SHARED feature engineering (train AND serve) — single source of truth
-  labels.py     # join readings ↔ machine_runs → multi-class label
-  dataset.py    # assemble leakage-safe train/val/test from Mongo
-  train.py      # train + tune + (Plan 03: MLflow log + register)
-  evaluate.py   # metrics, confusion, lead-time, baselines, SHAP
+  config.py        # H, window sizes, feature stride, feature list, paths, class names
+  features.py      # SHARED feature engineering (train AND serve); batch-seal mode; pipeline_version
+  labels.py        # join readings ↔ machine_runs → multi-class label
+  feature_store.py # Parquet shard read/write + feature_snapshots catalog helpers
+  dataset.py       # assemble leakage-safe train/val/test from (sealed shards ∪ rolling raw)
+  retention.py     # seal-and-prune job (Plan 03 owns the schedule)
+  train.py         # train + tune + (Plan 03: MLflow log + register + dataset manifest)
+  evaluate.py      # metrics, confusion, lead-time, baselines, SHAP
 ```
+
+`features.py` exposes a **`pipeline_version = hash(features.py source + cfg)`** that is
+stamped onto every sealed Parquet shard and every model artifact (so a model's exact
+feature definition is always reproducible). `config.py` carries a **feature stride**
+(default **1/min**): even though raw is per-second, sealed feature rows are emitted once
+per minute — the rolling-window stats already summarise the intervening seconds.
 
 ## B.3 Feature engineering — `ml/features.py` (the real work)
 Instantaneous sensor values are weak; **trends and variability over time** carry
@@ -148,10 +192,18 @@ Explicitly **drop** `_truth.*`, raw ids, and timestamps from the feature matrix
 (keep `session_id` only as a CV group key, not a feature).
 
 ```python
-def build_feature_row(window: list[dict], cfg) -> dict: ...
+def build_feature_row(window: list[dict], cfg) -> dict: ...      # one row from a trailing raw window
 def build_feature_frame(readings_by_session: dict, cfg) -> pandas.DataFrame: ...
+def seal_range(start_ts, end_ts, cfg) -> pandas.DataFrame: ...   # batch-seal: extract @ stride over a time range
 FEATURE_COLUMNS: list[str]   # frozen order, persisted with the model artifact
+pipeline_version: str        # hash(features.py + cfg) — stamped on shards + models
 ```
+
+`seal_range` is the **batch-seal** entry point used by `ml/retention.py` (Plan 03): it
+pulls the raw rows for `[start_ts, end_ts]` (plus the trailing `max_window` of context),
+emits feature rows at the configured **stride**, and returns the frame that gets written
+to a Parquet shard. The same `build_feature_row` is used live at serving time — one code
+path, no train/serve skew.
 
 ## B.4 Labelling — `ml/labels.py`
 For a reading at time `t` on machine `m`, find the **next** `machine_runs` failure
@@ -164,7 +216,12 @@ Yields the 5 classes; `none` will dominate (expected — handled in B.6).
 
 ## B.5 Dataset assembly + leakage-safe splitting — `ml/dataset.py`
 **This is the most error-prone step; getting it wrong silently inflates scores.**
-- Pull readings + events from Mongo; build features (B.3) + labels (B.4).
+- Assemble X/y from **two unioned sources**: (a) **sealed Parquet shards** of the current
+  `pipeline_version` (the aged, frozen history, read via `ml/feature_store.py`), and
+  (b) **features freshly extracted from the rolling 14-day raw window** via a SQL read of
+  `machine_readings` (using `build_feature_frame`). Labels (B.4) come from `machine_runs`
+  (kept forever) — a clean SQL/pandas merge on `session_id` + `failure_ts ≥ ts`. Drop
+  `truth_json` and ids before assembling `FEATURE_COLUMNS`.
 - **Never random-split** — consecutive readings are near-identical, so a random
   split leaks the future into the test set and produces fake ~100% accuracy.
 - Split **by machine-run / time**:
@@ -215,8 +272,9 @@ Persist together so serving (Part C) and the lifecycle (Plan 03) reuse exactly:
 - `model.json` via `booster.save_model` (version-stable across XGBoost releases),
 - `FEATURE_COLUMNS` (frozen order),
 - the label encoder / class order,
-- the feature config (`cfg`: H, window sizes).
-In Plan 03 this bundle is logged to MLflow + GridFS.
+- the feature config (`cfg`: H, window sizes, stride) + `pipeline_version`.
+In Plan 03 this bundle is logged to MLflow (with a filesystem/object-store backup) and the
+training run records its **dataset manifest** (shard list + rolling-window range).
 
 ## B.9 Step-by-step (model)
 1. Write `ml/config.py` (H, windows, paths, class names).
@@ -250,10 +308,11 @@ dashboard shows the model's predicted maintenance result per machine.
 _model = None  # cached
 def _load_model():        # load artifact bundle (B.8); refresh when version changes
 def predict_machine(machine: str) -> dict:
-    # 1. pull the latest window of readings for `machine` from Mongo
+    # 1. pull the latest window of readings for `machine` from MySQL
+    #    (select(Reading).where(machine).order_by(Reading.seq.desc()).limit(W))
     # 2. build_feature_row(window, cfg)        ← SAME ml/features.py as training
     # 3. model.predict_proba → class + probabilities
-    # 4. derive a lead-time/RUL-ish estimate; log to `predictions` collection
+    # 4. derive a lead-time/RUL-ish estimate; log to the `predictions` table
     # 5. return { machine, predicted_class, probabilities, lead_time_h, model_version, ts }
 def predict_all() -> list[dict]:               # every machine, sorted by risk
 ```
@@ -268,9 +327,9 @@ Register the router in `backend/app/main.py`. `/api/maintenance` upgrades the
 current rule-based `alerts_service` into **model-driven** alerts.
 
 ## C.3 Predictions logging
-Every scored reading → `predictions` collection
-`{ ts, session_id, seq, predicted_class, probabilities, model_version }`.
-This is what Plan 03's monitoring/feedback loop consumes.
+Every scored reading → `predictions` **table**
+`{ ts, session_id, seq, predicted_class, probabilities (JSON), model_version }`.
+This is what Plan 03's monitoring/feedback loop consumes (kept forever — small, never pruned).
 
 ## C.4 Frontend
 - **Per-machine maintenance-risk badge/card** on each live machine run: predicted
@@ -281,7 +340,7 @@ This is what Plan 03's monitoring/feedback loop consumes.
 
 ## C.5 Serving verification
 - `/api/maintenance` returns one entry per live machine with class + probabilities.
-- As the live stream runs, badges update and the **`predictions` collection fills**.
+- As the live stream runs, badges update and the **`predictions` table fills**.
 - Drive a machine toward failure (raise `GEN_ACCEL`): its predicted class flips to
   the correct component **before** the failure event lands in `machine_runs`.
 

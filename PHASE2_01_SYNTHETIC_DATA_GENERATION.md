@@ -12,6 +12,12 @@
 > noise, first-order thermal lag, Weibull lifetimes, Poisson shocks, physics-
 > consistent integration); data realism = **configurable imperfections**.
 >
+> **Store + retention (locked):** the sink is **MySQL** (SQLAlchemy + PyMySQL), not
+> MongoDB. Cadence stays **second-by-second** (`dt=3`), but raw `machine_readings` is a
+> **rolling 14-day window**: aged raw is sealed into versioned Parquet feature snapshots
+> (Plan 02/03) then pruned, so the store is bounded by design. `machine_runs` (labels)
+> is kept forever.
+>
 > Companion docs: `PHASE2_02_MODEL_TRAINING_EVALUATION.md`,
 > `PHASE2_03_ML_LIFECYCLE.md`.
 
@@ -23,7 +29,7 @@ Phase 1 built a working live pipeline:
 
 ```
 machine_data_generator.py  →  publisher.py  →  RabbitMQ (exchange "scada_data")
-        →  consumer.py  →  MongoDB (machine_telemetry.machine_readings)
+        →  consumer.py  →  MySQL (machine_telemetry.machine_readings)
         →  FastAPI backend  →  React dashboard
 ```
 
@@ -53,18 +59,23 @@ AI4I-2020, Azure PdM).
 
 ## 2. Architecture — what changes, what stays
 
-**Stays:** RabbitMQ topology, the publish/consume transport, MongoDB as the sink,
-and the `generate_one()` calling convention used by `publisher.py`.
+**Stays:** RabbitMQ topology, the publish/consume transport, and the `generate_one()`
+calling convention used by `publisher.py`. The reading **message** over RabbitMQ stays
+the same JSON shape.
 
 **Changes:**
 1. Rewrite the *brain* of `machine_data_generator.py` as a **stochastic degradation
    engine** (Sections 3–10).
-2. Extend the reading schema **additively** (Section 11) — frontend keeps working.
-3. **Multi-machine** driver + a failure/maintenance **event stream** → populate the
-   empty `machine_runs` collection (Section 12).
-4. **Checkpoint/resume** + **two-clock** design for natural continuous streaming
-   (Section 13).
-5. Add `backfill.py` for fast historical bootstrap; keep the live publisher (Section 14).
+2. **Store move: MongoDB → MySQL** (SQLAlchemy + PyMySQL). The schema (Section 11/12)
+   becomes **typed relational tables**; the consumer converts string→typed at ingest.
+3. Emit the new PM sensors + quality additively (Section 11) — frontend keeps working.
+4. **Multi-machine** driver + a failure/maintenance **event stream** → populate the
+   `machine_runs` table (Section 12).
+5. **Checkpoint/resume** + **two-clock** design for natural continuous streaming
+   (Section 13); checkpoints live in a `generator_state` table.
+6. Add `backfill.py` for fast historical bootstrap; keep the live publisher (Section 14).
+7. `machine_readings` is a **rolling 14-day window** — bounded by the seal/prune lifecycle
+   (Plan 03); `machine_runs` is retained forever (Section 14).
 
 ---
 
@@ -244,11 +255,12 @@ checkpoint (Section 13) so live runs stay reproducible across restarts.
 
 ---
 
-## 11. Extended document schema (additive — frontend unaffected)
+## 11. Reading schema — RabbitMQ message + MySQL table
 
-Keep every existing `plc`/`utility` field. Add `health` + `quality`, populate
-`EM_Power`/`EM_Energy`, let `state` vary. Hidden truth lives under `_truth` (dev/debug
-only; **the feature pipeline must exclude it** — see Plan 02).
+### 11.1 The message (unchanged JSON over RabbitMQ)
+The generator/publisher still emit this nested JSON; only the **sink** changes. Add
+`health` + `quality`, populate `EM_Power`/`EM_Energy`, let `state` vary. Hidden truth
+lives under `_truth` (dev/debug only; **the feature pipeline must exclude it** — Plan 02).
 
 ```jsonc
 {
@@ -282,21 +294,72 @@ only; **the feature pipeline must exclude it** — see Plan 02).
 }
 ```
 
+### 11.2 The MySQL table (consumer flattens message → typed columns)
+The **consumer** flattens the nested message into typed columns (no repeated BSON keys →
+far more compact), reusing `to_float`/`hms_to_minutes`/`parse_timestamp`/`map_status`.
+`_truth.*` is kept as one **dev-only** `truth_json` column — never fed to the model.
+
+```sql
+CREATE TABLE machine_readings (
+  id              BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  session_id      VARCHAR(64)  NOT NULL,
+  seq             INT          NOT NULL,
+  machine_name    VARCHAR(64)  NOT NULL,
+  state           VARCHAR(16)  NOT NULL,            -- running|idle|changeover|maintenance|error
+  ts              DATETIME(3)  NOT NULL,            -- was "timestamp"
+  -- plc.*
+  lot_1           BIGINT NULL, lot_2 BIGINT NULL, article INT NULL,
+  speed           DOUBLE NULL, length DOUBLE NULL, runmemory TINYINT(1) NULL,
+  lot_time_min    INT NULL, machine_time_min BIGINT NULL,
+  steam_consumed_lot DOUBLE NULL, water_consumed_lot DOUBLE NULL,
+  power_consumed_lot DOUBLE NULL, air_consumed_lot DOUBLE NULL,
+  -- utility.*
+  sf_flow  DOUBLE NULL, sf_tot  DOUBLE NULL,
+  wat_flow DOUBLE NULL, wat_tot DOUBLE NULL,
+  em_power DOUBLE NULL, em_energy DOUBLE NULL,      -- kW / kWh (now populated)
+  -- health.*  (PM sensors)
+  vibration_rms DOUBLE NULL, motor_current DOUBLE NULL,
+  bearing_temp  DOUBLE NULL, winding_temp  DOUBLE NULL, air_pressure DOUBLE NULL,
+  -- quality.*
+  good_count INT NULL, reject_count INT NULL,
+  -- _truth.*  (DEV ONLY — exclude from features)
+  truth_json JSON NULL,
+  UNIQUE KEY uq_session_seq (session_id, seq),       -- idempotent re-delivery
+  KEY idx_ts (ts), KEY idx_machine (machine_name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+The `UNIQUE(session_id, seq)` lets the consumer `INSERT … ON DUPLICATE KEY UPDATE` so a
+publisher restart never duplicates rows. The shared SQLAlchemy ORM (`models.py`,
+Plan 02) defines `Reading` for this table and is imported by consumer + backend + ML.
+
 ---
 
-## 12. `machine_runs` event documents (the simulated maintenance log)
+## 12. `machine_runs` events (the simulated maintenance log)
 
-One document per run-to-failure cycle — the **source of truth for labelling**:
+One row per run-to-failure cycle — the **source of truth for labelling**, emitted on the
+`scada.machine.event` routing key and written to MySQL. **Never pruned** (tiny, and the
+label source for every future retrain).
 
-```jsonc
-{
-  "session_id": "…", "machine_name": "Machine 1",
-  "component": "bearing",            // which component failed
-  "severity": "failure",             // failure | scheduled_maintenance
-  "run_start_ts": "…", "failure_ts": "…", "repair_ts": "…",
-  "run_hours_to_failure": 312.5, "seq_at_failure": 9981
-}
+```sql
+CREATE TABLE machine_runs (
+  id                   BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  session_id           VARCHAR(64)  NOT NULL,
+  machine_name         VARCHAR(64)  NOT NULL,
+  component            VARCHAR(32)  NOT NULL,       -- bearing|steam_valve|heater|water_pump
+  severity             VARCHAR(32)  NOT NULL,       -- failure | scheduled_maintenance
+  run_start_ts         DATETIME(3)  NULL,
+  failure_ts           DATETIME(3)  NULL,
+  repair_ts            DATETIME(3)  NULL,
+  run_hours_to_failure DOUBLE       NULL,
+  seq_at_failure       INT          NULL,
+  KEY idx_session (session_id), KEY idx_machine (machine_name),
+  KEY idx_failure_ts (failure_ts), KEY idx_component (component)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ```
+
+The message the publisher emits is the same field set as JSON; the consumer inserts it as
+a typed row (ORM `MachineRun`, Plan 02).
 
 ---
 
@@ -312,9 +375,10 @@ physics ⇒ history and live tail are statistically indistinguishable.
 ### 13.2 Checkpoint / resume — THE key to no seams
 Persist the generator's **full** state — per-component `D`/health, all totalizers,
 `EM_Energy`, `machine_time`, `length`, current lot/article, state-machine state +
-remaining sojourn, `seq`, **and the RNG state** — to a `generator_state` collection
-every `CHECKPOINT_EVERY` readings. On startup, **resume** so totalizers/health/time
-*continue*. Without this, a restart resets everything and instantly looks fake.
+remaining sojourn, `seq`, **and the RNG state** — to a `generator_state` table (one row
+per machine, full serialized state + RNG as a `JSON`/`LONGBLOB` column) every
+`CHECKPOINT_EVERY` readings. On startup, **resume** so totalizers/health/time *continue*.
+Without this, a restart resets everything and instantly looks fake.
 
 ### 13.3 Seamless backfill → live handoff
 Backfill produces history ending at "now" and saves its final state; live boots from
@@ -344,10 +408,27 @@ repeats exactly ⇒ no spottable period.
 Multi-class training needs **many failures of each type**; a live 1-reading/few-sec
 stream alone would take months. Same engine:
 
-1. **`backfill.py` (bootstrap)** — sim-clock, bulk-insert directly to Mongo;
-   *weeks–months* across *many* machines ⇒ ≥ a few hundred examples per class. Knobs:
-   machines, sim weeks, `dt`, `GEN_ACCEL` (accelerated wear for bootstrap).
+1. **`backfill.py` (bootstrap)** — sim-clock, bulk-insert directly to MySQL (batched
+   `executemany`); *weeks–months* across *many* machines ⇒ ≥ a few hundred examples per
+   class. Knobs: machines, sim weeks, `dt`, `GEN_ACCEL` (accelerated wear for bootstrap).
 2. **Live stream (demo)** — existing `publisher.py` path, real-time.
+
+### 14.1 Cadence stays second-by-second (`dt=3`)
+Seconds give the **richest PM signal** (fine vibration/temperature texture, sub-minute
+transients). The usual objection — that second-level rows are bulky and redundant for a
+24 h horizon — is handled not by coarsening the cadence but by **retention**: see §14.2.
+
+### 14.2 `machine_readings` is a rolling 14-day window (bounded by design)
+Raw is a **hot, short-lived tier**. Aged raw (older than the rolling window) is **sealed**
+into versioned Parquet feature snapshots — sampled at a coarse **1/min stride**, since the
+rolling-window stats already summarise the intervening seconds — and then **pruned**
+(seal → verify → prune; Plan 03 owns the job). So:
+- raw row count **plateaus** at ≈ `14 d × 86400/dt × machines` instead of growing forever;
+- the durable training asset is the **Parquet feature store + `feature_snapshots` catalog**
+  (Plan 02/03), not the raw table;
+- `machine_runs` (labels) is **never** pruned.
+
+Backfill **seeds** the corpus; the seal/prune lifecycle keeps the store bounded thereafter.
 
 ---
 
@@ -367,18 +448,22 @@ Keep the public surface (`SyntheticMachineGenerator`, `generate_one()`); decompo
   for checkpoint (§13.2); `pop_events()`
 
 ### 15.2 `rabbitmq/producer/publisher/backfill.py` (new)
-Loop sim-clock across N machines; buffer readings → `insert_many` (batched); collect
-`pop_events()` → `machine_runs`; create indexes `(session_id, seq)`, `timestamp`;
-print per-class failure counts; save final checkpoint for handoff.
+Loop sim-clock across N machines; buffer readings → batched `executemany` INSERT into
+MySQL `machine_readings`; collect `pop_events()` → `machine_runs`; rely on the table
+indexes/`UNIQUE(session_id, seq)`; print per-class failure counts; save final checkpoint
+(`generator_state` row) for handoff.
 
 ### 15.3 `publisher.py` (extend)
 N generators (multi-machine), wall-clock; publish telemetry on `scada.tag.data` and
 events on a second routing key `scada.machine.event`; checkpoint periodically;
 graceful shutdown → final checkpoint.
 
-### 15.4 `consumer.py` (extend)
-Telemetry → `machine_readings` (unchanged); add a handler bound to
-`scada.machine.event` → `machine_runs`; ensure indexes on both.
+### 15.4 `consumer.py` (extend → MySQL)
+Swap `MongoClient`/`insert_one` for a SQLAlchemy session (`models.py`). Telemetry →
+`machine_readings` with **string→typed conversion at ingest** (reuse `to_float`,
+`hms_to_minutes`, `parse_timestamp`, `map_status`) and idempotent
+`INSERT … ON DUPLICATE KEY UPDATE`; add a handler bound to `scada.machine.event` →
+`machine_runs`. Tables/indexes created from the ORM (`Base.metadata.create_all`).
 
 ---
 
@@ -389,21 +474,27 @@ Telemetry → `machine_readings` (unchanged); add a handler bound to
 `GAMMA_ALPHA/BETA`, `SHOCK_LAMBDA`, `FAIL_THRESHOLD`; per-sensor `OU_THETA/SIGMA`,
 `THERMAL_TAU`, `NOISE_SIGMA`; calendar `SHIFTS/BREAKS/WEEKEND`; imperfections
 `P_DROP/P_OUTLIER/P_STUCK/TS_JITTER`; `CHECKPOINT_EVERY`. Section 3 domain ranges ship
-as defaults. (Reuse `MONGODB_URI`/`MONGODB_DB` from `backend/app/config.py`.)
+as defaults.
+
+**Store config:** `DATABASE_URL` (e.g.
+`mysql+pymysql://smartai:password@localhost:3306/machine_telemetry?charset=utf8mb4`),
+read from `backend/app/config.py`. Deps to add: `SQLAlchemy>=2.0`, `PyMySQL>=1.1`,
+`cryptography` (MySQL 8 `caching_sha2_password` auth), optional `alembic`.
 
 ---
 
 ## 17. Step-by-step execution
 
-1. Snapshot the current `machine_readings` count (it's disposable dummy data).
+1. Stand up **MySQL 8** (local Docker `mysql:8` or a sized instance); create the
+   `machine_telemetry` schema; add `DATABASE_URL` (§16); create tables from the ORM.
 2. Implement §15.1 engine; sanity-run one machine standalone: health decays then
    resets on repair, sensors track health, events emit at failure, physics
    identities hold.
-3. Implement §15.2 `backfill.py`. (Confirm with the user before any wipe of
-   `machine_readings`/`machine_runs` — see Plan 03 for a safe wipe.)
+3. Implement §15.2 `backfill.py` (batched INSERT to MySQL).
 4. Run backfill (env per §16); watch the per-class failure summary.
 5. Implement §15.3/§15.4; run `consumer.py` then `publisher.py`; confirm live
-   readings + events land in both collections and a restart resumes cleanly.
+   readings + events land in both tables and a restart resumes cleanly (idempotent
+   on `UNIQUE(session_id, seq)`).
 6. Run the §18 verification.
 
 ---
@@ -411,10 +502,11 @@ as defaults. (Reuse `MONGODB_URI`/`MONGODB_DB` from `backend/app/config.py`.)
 ## 18. Verification & acceptance
 
 **Structural (from the dataset):**
-- `machine_readings.distinct("state")` returns all five states.
-- `utility.EM_Power == null` is ~0 during `running` (aside from configured dropouts).
-- `machine_runs` grouped by `component` shows every class with ≥ a few hundred events.
-- `quality.reject_count > 0` exists and correlates with degraded valve/heater runs.
+- `SELECT DISTINCT state FROM machine_readings` returns all five states.
+- `em_power IS NULL` is ~0 during `running` (aside from configured dropouts).
+- `SELECT component, COUNT(*) FROM machine_runs GROUP BY component` shows every class with
+  ≥ a few hundred events.
+- `reject_count > 0` exists and correlates with degraded valve/heater runs.
 
 **Realism (the methodology checks):**
 - **Smoothness** — autocorrelation of `SF_Flow`/`Wat_Flow` clearly > 0 (OU working).

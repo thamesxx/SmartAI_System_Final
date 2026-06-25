@@ -308,11 +308,13 @@ class SyntheticMachineGenerator:
         dt: float = 3.0,
         sim_start_ts: datetime = None,
         imperfection_cfg: dict = None,
+        no_calendar: bool = False,
     ):
         self.machine_id = machine_id
         self.machine_name = f"Machine {machine_id + 1}"
         self.dt = dt
         self.accel = accel
+        self.no_calendar = no_calendar  # if True, skip shift/weekend checks
 
         self.rng = random.Random(seed if seed is not None else random.randint(0, 2**31))
 
@@ -433,7 +435,7 @@ class SyntheticMachineGenerator:
                     return
 
             # Check calendar (night stop / weekend)
-            if not _in_shift(self.sim_ts):
+            if not self.no_calendar and not _in_shift(self.sim_ts):
                 idle_sec = _seconds_to_shift_end(self.sim_ts)
                 self.state = "idle"
                 self.state_remaining_s = idle_sec + self.rng.uniform(-120, 120)

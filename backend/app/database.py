@@ -1,39 +1,49 @@
-"""MongoDB access layer + shared parsing helpers.
+"""MySQL access layer + shared parsing helpers (SQLAlchemy 2.0).
 
-All backend data is read from the `machine_telemetry` database, collection
-`machine_readings`. Each document is one time-stamped reading of a machine run
-(identified by `session_id`). See README/config for connection details.
+All backend data lives in the `machine_telemetry` MySQL database.
+See app/models.py for ORM definitions and app/config.py for DATABASE_URL.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime
-from typing import Optional
+from typing import Iterator, Optional
 
-from pymongo import MongoClient
+from sqlalchemy import create_engine, func, select
+from sqlalchemy.orm import Session, sessionmaker
 
-from app.config import MONGO_URI, DB_NAME
+from app.config import DATABASE_URL
+from app.models import Base, Reading
 
-_client: Optional[MongoClient] = None
+_engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    pool_recycle=3600,
+    echo=False,
+)
 
-
-def get_client() -> MongoClient:
-    global _client
-    if _client is None:
-        _client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=8000)
-    return _client
-
-
-def get_db():
-    return get_client()[DB_NAME]
+SessionLocal: sessionmaker[Session] = sessionmaker(bind=_engine, expire_on_commit=False)
 
 
-def readings_collection():
-    """The machine_readings collection (the only populated collection)."""
-    return get_db()["machine_readings"]
+def create_tables() -> None:
+    """Create all tables if they don't exist yet (idempotent)."""
+    Base.metadata.create_all(_engine)
 
 
-# ── Parsing helpers ──────────────────────────────────────────────────────────
-# PLC/utility values arrive as strings ("25.00"), numbers, or null.
+@contextmanager
+def get_session() -> Iterator[Session]:
+    session = SessionLocal()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+# ── Parsing helpers (same API as the old Mongo version) ──────────────────────
 
 def to_float(value, default: float = 0.0) -> float:
     if value is None:
@@ -45,17 +55,19 @@ def to_float(value, default: float = 0.0) -> float:
 
 
 def hms_to_minutes(value) -> int:
-    """Convert an "H:M:S" string (e.g. "7051:33:23") to whole minutes."""
-    if not value:
+    """Accept either an integer seconds value (stored in DB) or an 'H:M:S' string."""
+    if value is None:
         return 0
+    if isinstance(value, (int, float)):
+        return int(value) // 60
     try:
         nums = [int(p) for p in str(value).split(":")]
     except ValueError:
         return 0
     while len(nums) < 3:
         nums.insert(0, 0)
-    hours, minutes, seconds = nums[0], nums[1], nums[2]
-    return int(hours * 60 + minutes + round(seconds / 60))
+    h, m, s = nums[0], nums[1], nums[2]
+    return int(h * 60 + m + round(s / 60))
 
 
 def parse_timestamp(value) -> Optional[datetime]:
@@ -69,7 +81,7 @@ def parse_timestamp(value) -> Optional[datetime]:
         return None
 
 
-_VALID_STATUS = {"running", "idle", "maintenance", "error"}
+_VALID_STATUS = {"running", "idle", "maintenance", "error", "changeover"}
 
 
 def map_status(state) -> str:
@@ -78,14 +90,12 @@ def map_status(state) -> str:
 
 
 def session_name_map() -> dict[str, str]:
-    """Map each session_id to a stable display name ("Machine 1", "Machine 2"…),
-    ordered by the session's first reading timestamp."""
-    col = readings_collection()
-    sessions = []
-    for sid in col.distinct("session_id"):
-        first = col.find_one(
-            {"session_id": sid}, sort=[("seq", 1)], projection={"timestamp": 1}
-        )
-        sessions.append((str(first["timestamp"]) if first else "", sid))
-    sessions.sort()
-    return {sid: f"Machine {i + 1}" for i, (_, sid) in enumerate(sessions)}
+    """Map each machine_name to a stable display label ('Machine 1', 'Machine 2'…),
+    ordered by the machine's earliest recorded timestamp."""
+    with get_session() as session:
+        rows = session.execute(
+            select(Reading.machine_name, func.min(Reading.ts).label("first_ts"))
+            .group_by(Reading.machine_name)
+            .order_by(func.min(Reading.ts))
+        ).all()
+    return {row.machine_name: f"Machine {i + 1}" for i, row in enumerate(rows)}

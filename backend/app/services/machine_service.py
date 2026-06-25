@@ -1,59 +1,65 @@
-"""Machine cards and status timeline, sourced from machine_readings."""
-from app.database import (
-    readings_collection,
-    session_name_map,
-    to_float,
-    hms_to_minutes,
-    map_status,
-    parse_timestamp,
-)
+"""Machine cards and status timeline (MySQL / SQLAlchemy 2.0)."""
+from sqlalchemy import case, func, select
+
+from app.database import get_session, session_name_map, to_float, hms_to_minutes, map_status
+from app.models import Reading
 
 
 def get_machine_data():
-    """One card per session (machine run), built from its latest reading."""
-    col = readings_collection()
+    """One card per physical machine, built from its latest reading."""
     names = session_name_map()
-    out = []
-    for sid, name in sorted(names.items(), key=lambda kv: kv[1]):
-        doc = col.find_one({"session_id": sid}, sort=[("seq", -1)])
-        if not doc:
-            continue
-        plc = doc.get("plc", {})
-        out.append({
-            "id": sid,
-            "name": name,
-            "lot1": str(plc.get("lot_1", "")),
-            "lot2": str(plc.get("lot_2", "")),
-            "articleNumber": str(plc.get("article", "")),
-            "totalLength": to_float(plc.get("length")),
-            "status": map_status(doc.get("state")),
-            "lotTime": hms_to_minutes(plc.get("lot_time")),
-            "machineRunningTime": hms_to_minutes(plc.get("machine_time")),
-            "speed": to_float(plc.get("speed")),
-        })
+
+    with get_session() as session:
+        machine_names = session.scalars(
+            select(Reading.machine_name).distinct().order_by(Reading.machine_name)
+        ).all()
+
+        out = []
+        for mname in machine_names:
+            r = session.scalars(
+                select(Reading)
+                .where(Reading.machine_name == mname)
+                .order_by(Reading.ts.desc())
+                .limit(1)
+            ).first()
+            if r is None:
+                continue
+            out.append({
+                "id": mname,
+                "name": names.get(mname, mname),
+                "lot1": str(r.lot_1 or ""),
+                "lot2": str(r.lot_2 or ""),
+                "articleNumber": str(r.article or ""),
+                "totalLength": to_float(r.length),
+                "status": map_status(r.state),
+                "lotTime": hms_to_minutes(r.lot_time_s),
+                "machineRunningTime": hms_to_minutes(r.machine_time_s),
+                "speed": to_float(r.speed),
+            })
     return out
 
 
 def get_machine_timeline(range: str = "shift"):
     """Bucket every reading into running/stopped counts.
 
-    Hourly buckets for shift/day, daily buckets for week/month. The counts are
-    a proxy for minutes spent in each state (one reading ≈ one sample).
+    Hourly buckets for shift/day; daily buckets for week/month.
     """
-    col = readings_collection()
     daily = range in ("week", "month")
-    buckets: dict[str, list[int]] = {}
-    for doc in col.find({}, projection={"timestamp": 1, "state": 1}):
-        ts = parse_timestamp(doc.get("timestamp"))
-        if ts is None:
-            continue
-        key = ts.strftime("%m-%d") if daily else ts.strftime("%H:00")
-        bucket = buckets.setdefault(key, [0, 0])
-        if map_status(doc.get("state")) == "running":
-            bucket[0] += 1
-        else:
-            bucket[1] += 1
+    fmt = "%m-%d" if daily else "%H:00"
+
+    with get_session() as session:
+        rows = session.execute(
+            select(
+                func.date_format(Reading.ts, fmt).label("bucket"),
+                func.sum(case((Reading.state == "running", 1), else_=0)).label("running"),
+                func.sum(case((Reading.state != "running", 1), else_=0)).label("stopped"),
+            )
+            .where(Reading.ts.is_not(None))
+            .group_by(func.date_format(Reading.ts, fmt))
+            .order_by(func.date_format(Reading.ts, fmt))
+        ).all()
+
     return [
-        {"time": key, "running": running, "stopped": stopped}
-        for key, (running, stopped) in sorted(buckets.items())
+        {"time": row.bucket, "running": int(row.running or 0), "stopped": int(row.stopped or 0)}
+        for row in rows
     ]
